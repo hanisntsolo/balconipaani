@@ -7,6 +7,7 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
 #include <time.h>
@@ -49,7 +50,7 @@ struct DeviceConfig {
   uint16_t maxRuntimeSec;
   int16_t  timezoneOffsetMinutes;
   uint8_t  checksum;             // XOR over all bytes before this field
-};
+} __attribute__((packed));       // no compiler padding — EEPROM layout must be exact
 
 static_assert(sizeof(DeviceConfig) < EEPROM_BYTES, "Config too large for EEPROM");
 
@@ -151,12 +152,17 @@ label{display:block;font-size:.78rem;color:var(--dim);margin:8px 0 3px}
     </div>
   </div>
 
-  <div class="card">
+  <div class="card" id="wifi-card">
     <h2>WiFi</h2>
-    <label>SSID</label><input id="ssid" type="text" maxlength="32" autocomplete="off">
-    <label>Password</label><input id="wfPass" type="password" maxlength="64" autocomplete="new-password">
-    <div class="row">
-      <button onclick="saveWifi()">Save &amp; Reboot</button>
+    <div id="wifi-conn-row"></div>
+    <div id="wifi-form">
+      <label>SSID</label><input id="ssid" type="text" maxlength="32" autocomplete="off">
+      <label>Password</label><input id="wfPass" type="password" maxlength="64" autocomplete="new-password">
+      <div class="row">
+        <button onclick="saveWifi()">Save &amp; Reboot</button>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
       <button onclick="doReboot()">Reboot</button>
     </div>
   </div>
@@ -164,6 +170,7 @@ label{display:block;font-size:.78rem;color:var(--dim);margin:8px 0 3px}
 </div>
 <script>
 const two = n => String(n).padStart(2,'0');
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
 function draw(s) {
   document.getElementById('ver').textContent = s.version || '';
@@ -188,10 +195,14 @@ function draw(s) {
   const sch = s.scheduleEnabled
     ? `<br><span class="dim">Daily: ${two(s.scheduleHour)}:${two(s.scheduleMinute)}, ${s.scheduleDurationSec}s</span>`
     : '';
+  const ipLink = `<a href="http://${s.ip}" style="color:var(--ok)">${s.ip}</a>`;
+  const mdnsLink = s.wifiConnected
+    ? ` · <a href="http://balconipaani.local" style="color:var(--ok)">balconipaani.local</a>`
+    : '';
 
   document.getElementById('sb').innerHTML =
     `${mode}${valve}${net}${ntp}${rssi}${rt}${lw}` +
-    `<br><span class="dim">IP: ${s.ip} · Uptime: ${s.uptimeSec}s · ${s.localTime}</span>${sch}`;
+    `<br><span class="dim">IP: ${ipLink}${mdnsLink} · Uptime: ${s.uptimeSec}s · ${s.localTime}</span>${sch}`;
 
   // Runtime progress bar
   const bar  = document.getElementById('rtbar');
@@ -203,6 +214,19 @@ function draw(s) {
     fill.style.background = pct > 80 ? 'var(--bad)' : pct > 55 ? 'var(--warn)' : 'var(--ok)';
   } else {
     bar.style.display = 'none';
+  }
+
+  // WiFi section: hide credential form when already connected
+  const connRow  = document.getElementById('wifi-conn-row');
+  const wifiForm = document.getElementById('wifi-form');
+  if (s.wifiConnected) {
+    connRow.innerHTML =
+      `<span class="dim">Connected: <b>${esc(s.connectedSsid)}</b></span> ` +
+      `<a href="#" style="color:var(--ok);font-size:.82rem" onclick="document.getElementById('wifi-form').style.display='block';return false">Change</a>`;
+    wifiForm.style.display = 'none';
+  } else {
+    connRow.innerHTML = `<span class="pill warn">Not connected — enter credentials below</span>`;
+    wifiForm.style.display = 'block';
   }
 
   document.getElementById('schEnabled').value = s.scheduleEnabled ? '1' : '0';
@@ -260,7 +284,13 @@ async function saveWifi() {
       ssid,
       password: document.getElementById('wfPass').value,
     });
-    alert('Credentials saved. Reconnect to your WiFi network then reload.');
+    alert(
+      'Credentials saved!\n\n' +
+      '1. Reconnect YOUR device to your home WiFi network.\n' +
+      '2. Open: http://balconipaani.local\n\n' +
+      'If balconipaani.local does not work (Android), check your\n' +
+      'router\'s DHCP client list for the "balconipaani" hostname.'
+    );
   } catch (_) {}
 }
 async function doReboot() {
@@ -303,7 +333,9 @@ void persistConfig() {
   config.checksum      = 0;
   config.checksum      = configChecksum(config);
   EEPROM.put(0, config);
-  EEPROM.commit();
+  if (!EEPROM.commit()) {
+    Serial.println("EEPROM commit FAILED — credentials not saved!");
+  }
 }
 
 void loadConfig() {
@@ -392,6 +424,8 @@ bool connectStation() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[%lu] WiFi connected  IP=%s  RSSI=%d dBm\n",
                   millis(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    MDNS.begin("balconipaani");
+    Serial.printf("[%lu] mDNS: http://balconipaani.local\n", millis());
     return true;
   }
   Serial.printf("[%lu] WiFi timeout — falling back to AP mode\n", millis());
@@ -425,6 +459,7 @@ void attemptWifiReconnect() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[%lu] WiFi reconnected  IP=%s\n",
                   millis(), WiFi.localIP().toString().c_str());
+    MDNS.begin("balconipaani");
     startTimeSync();  // re-sync NTP after link recovery
   } else {
     Serial.printf("[%lu] WiFi reconnect failed — will retry in %lus\n",
@@ -470,7 +505,9 @@ void sendStatusJson() {
   j += "\",\"uptimeSec\":";     j += millis() / 1000;
   j += ",\"localTime\":\"";     j += localTimeText();
   j += "\",\"ntpSynced\":";     j += runtime.ntpSynced ? "true" : "false";
-  j += "}";
+  j += ",\"connectedSsid\":\""; j += wifiOk ? WiFi.SSID() : "";
+  j += "\",\"configuredSsid\":\""; j += String(config.ssid);
+  j += "\"}";
 
   server.send(200, "application/json", j);
 }
@@ -642,6 +679,7 @@ void setup() {
 void loop() {
   server.handleClient();
   if (apMode) dnsServer.processNextRequest();
+  MDNS.update();
   attemptWifiReconnect();
   runSchedulerAndSafety();
 
