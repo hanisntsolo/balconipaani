@@ -1,46 +1,73 @@
+// BalconiPaani MVP2.1 — ESP8266 Irrigation Controller
+// Production firmware: local-only, zero cloud dependency.
+//
+// Hardware:
+//   NodeMCU ESP8266 + LOW-trigger relay on D2 → 24V solenoid valve.
+//   Shared GND between ESP USB supply and relay 24V supply.
+
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <DNSServer.h>
 #include <EEPROM.h>
 #include <time.h>
 
-constexpr uint8_t RELAY_PIN = D2;          // LOW-trigger relay input
-constexpr uint16_t EEPROM_BYTES = 1024;
-constexpr uint32_t CONFIG_MAGIC = 0xBADA2401;
-constexpr uint16_t WIFI_CONNECT_TIMEOUT_MS = 20000;
-constexpr uint16_t STATUS_POLL_MS = 500;
-constexpr char AP_SSID[] = "BalconiPaani-Setup";
+// ── Firmware identity ──────────────────────────────────────────────────────
+constexpr char     FIRMWARE_VERSION[]         = "MVP2.1";
+
+// ── Hardware ───────────────────────────────────────────────────────────────
+constexpr uint8_t  RELAY_PIN                  = D2;   // LOW-trigger relay
+
+// ── EEPROM ─────────────────────────────────────────────────────────────────
+constexpr uint16_t EEPROM_BYTES               = 512;
+constexpr uint32_t CONFIG_MAGIC               = 0xBADA2402; // bump on struct change
+constexpr uint8_t  CONFIG_VERSION             = 1;
+
+// ── Timing ─────────────────────────────────────────────────────────────────
+constexpr uint16_t WIFI_CONNECT_TIMEOUT_MS    = 20000;
+constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 60000UL; // retry lost connection
+constexpr uint16_t SCHEDULER_TICK_MS          = 500;
+constexpr uint8_t  SCHEDULE_WINDOW_SEC        = 10;     // fire window per trigger
+
+// ── AP fallback ────────────────────────────────────────────────────────────
+constexpr char AP_SSID[]     = "BalconiPaani-Setup";
 constexpr char AP_PASSWORD[] = "balconi123";
 
 ESP8266WebServer server(80);
-DNSServer dnsServer;
+DNSServer        dnsServer;
 
+// ── Persistent config (EEPROM-backed) ─────────────────────────────────────
 struct DeviceConfig {
   uint32_t magic;
-  char ssid[33];
-  char password[65];
-  bool autoMode;
-  bool scheduleEnabled;
-  uint8_t scheduleHour;
-  uint8_t scheduleMinute;
+  uint8_t  configVersion;
+  char     ssid[33];
+  char     password[65];
+  bool     autoMode;
+  bool     scheduleEnabled;
+  uint8_t  scheduleHour;
+  uint8_t  scheduleMinute;
   uint16_t scheduleDurationSec;
   uint16_t maxRuntimeSec;
-  int16_t timezoneOffsetMinutes;
-  uint8_t checksum;
+  int16_t  timezoneOffsetMinutes;
+  uint8_t  checksum;             // XOR over all bytes before this field
 };
 
 static_assert(sizeof(DeviceConfig) < EEPROM_BYTES, "Config too large for EEPROM");
 
+// ── Volatile runtime state (lost on power cycle) ───────────────────────────
 struct RuntimeState {
-  bool valveOn;
-  bool startedByScheduler;
+  bool     valveOn;
+  bool     startedByScheduler;
   uint32_t valveOnSinceMs;
-  int32_t lastScheduleDayKey;
-  uint32_t lastStatusTickMs;
+  int32_t  lastScheduleDayKey;
+  uint32_t lastTickMs;
+  uint32_t lastWifiCheckMs;
+  uint32_t lastValveOffMs;   // 0 = not used this session
+  bool     ntpSynced;
+  bool     pendingReboot;    // defers ESP.restart() out of HTTP handler
 };
 
 DeviceConfig config;
-RuntimeState runtime{false, false, 0, -1, 0};
+RuntimeState runtime{};
 bool apMode = false;
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -48,118 +75,201 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BalconiPaani Controller</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BalconiPaani</title>
 <style>
-:root{--bg:#0f172a;--card:#111827;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--text:#e5e7eb}
-*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto;background:var(--bg);color:var(--text)}
-.wrap{max-width:720px;margin:auto;padding:14px}.card{background:var(--card);padding:14px;border-radius:12px;margin:10px 0}
-h1{font-size:1.2rem;margin:0 0 10px}h2{font-size:1rem;margin:0 0 10px}.row{display:flex;gap:8px;flex-wrap:wrap}
-button,input{border-radius:10px;border:1px solid #334155;padding:10px;font-size:1rem}
-button{cursor:pointer;background:#1f2937;color:#fff;min-width:110px}
-button.ok{background:var(--ok);color:#062b11}button.bad{background:var(--bad)}button.warn{background:var(--warn);color:#3b2201}
-label{display:block;font-size:.85rem;margin:8px 0 4px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-@media (max-width:560px){.grid{grid-template-columns:1fr}}
-.status{font-size:.95rem;line-height:1.5}.pill{display:inline-block;padding:3px 8px;border-radius:999px;background:#1e293b;margin-right:6px}
-small{opacity:.75}
+:root{--bg:#0f172a;--card:#111827;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--text:#e5e7eb;--dim:#94a3b8}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+.wrap{max-width:720px;margin:auto;padding:12px}
+.card{background:var(--card);padding:14px;border-radius:14px;margin:10px 0}
+h1{font-size:1.15rem;margin:0 0 10px}
+h2{font-size:.9rem;margin:0 0 10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+button{cursor:pointer;background:#1e293b;color:#fff;border:1px solid #334155;border-radius:10px;padding:10px 18px;font-size:.95rem;min-width:110px;transition:opacity .15s}
+button:active{opacity:.7}
+button.ok{background:var(--ok);color:#052e16;border-color:var(--ok)}
+button.bad{background:var(--bad);border-color:var(--bad)}
+button.warn{background:var(--warn);color:#3b2201;border-color:var(--warn)}
+input,select{border-radius:8px;border:1px solid #334155;padding:9px;font-size:.9rem;background:#0f172a;color:var(--text);width:100%}
+label{display:block;font-size:.78rem;color:var(--dim);margin:8px 0 3px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+@media(max-width:560px){.grid{grid-template-columns:1fr}}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;font-size:.8rem;background:#1e293b;margin:2px 3px 2px 0;vertical-align:middle}
+.pill.ok{background:var(--ok);color:#052e16}
+.pill.bad{background:var(--bad)}
+.pill.warn{background:var(--warn);color:#3b2201}
+.dim{color:var(--dim);font-size:.82rem}
+#rtbar{height:5px;border-radius:3px;background:#1e293b;overflow:hidden;margin-top:8px;display:none}
+#rtfill{height:100%;background:var(--ok);width:0%;transition:width .5s}
 </style>
 </head>
 <body>
 <div class="wrap">
+
   <div class="card">
-    <h1>BalconiPaani MVP2</h1>
-    <div id="status" class="status">Loading…</div>
-    <small>Manual OFF always works. Valve has hard runtime cap.</small>
+    <h1>💧 BalconiPaani <span class="dim" id="ver" style="font-weight:400;font-size:.85rem"></span></h1>
+    <div id="sb">Loading…</div>
+    <div id="rtbar"><div id="rtfill"></div></div>
+    <div class="dim" style="margin-top:8px">Manual OFF always works · Hard runtime cap enforced</div>
   </div>
 
   <div class="card">
     <h2>Mode</h2>
     <div class="row">
-      <button onclick="setMode('manual')" class="warn">MANUAL</button>
-      <button onclick="setMode('auto')" class="ok">AUTO</button>
+      <button class="warn" onclick="setMode('manual')">MANUAL</button>
+      <button class="ok"   onclick="setMode('auto')">AUTO</button>
     </div>
   </div>
 
   <div class="card">
-    <h2>Manual Valve Control</h2>
+    <h2>Manual Valve</h2>
     <div class="row">
-      <button onclick="valve('on')" class="ok">Valve ON</button>
-      <button onclick="valve('off')" class="bad">Valve OFF</button>
+      <button class="ok"  onclick="valve('on')">Valve ON</button>
+      <button class="bad" onclick="valve('off')">Valve OFF</button>
     </div>
   </div>
 
   <div class="card">
-    <h2>Scheduler & Safety</h2>
+    <h2>Scheduler &amp; Safety</h2>
     <div class="grid">
-      <div><label>Enabled (0/1)</label><input id="schEnabled" type="number" min="0" max="1"></div>
-      <div><label>Start (HH:MM)</label><input id="schTime" type="time"></div>
+      <div>
+        <label>Schedule</label>
+        <select id="schEnabled">
+          <option value="0">Disabled</option>
+          <option value="1">Enabled</option>
+        </select>
+      </div>
+      <div><label>Start Time (HH:MM)</label><input id="schTime" type="time"></div>
       <div><label>Water Duration (sec)</label><input id="schDuration" type="number" min="5" max="3600"></div>
       <div><label>Max Runtime Cap (sec)</label><input id="maxRuntime" type="number" min="10" max="7200"></div>
-      <div><label>Timezone Offset (min)</label><input id="tzOffset" type="number" min="-720" max="840"></div>
+      <div><label>Timezone Offset (min, e.g. IST=330)</label><input id="tzOffset" type="number" min="-720" max="840"></div>
     </div>
-    <div class="row" style="margin-top:10px">
+    <div class="row">
       <button onclick="saveSchedule()">Save Schedule</button>
       <button onclick="refresh()">Refresh</button>
     </div>
   </div>
 
   <div class="card">
-    <h2>WiFi Onboarding</h2>
-    <label>SSID</label><input id="ssid" type="text" maxlength="32" style="width:100%">
-    <label>Password</label><input id="password" type="password" maxlength="64" style="width:100%">
-    <div class="row" style="margin-top:10px">
-      <button onclick="saveWifi()">Save WiFi & Reboot</button>
-      <button onclick="reboot()">Reboot</button>
+    <h2>WiFi</h2>
+    <label>SSID</label><input id="ssid" type="text" maxlength="32" autocomplete="off">
+    <label>Password</label><input id="wfPass" type="password" maxlength="64" autocomplete="new-password">
+    <div class="row">
+      <button onclick="saveWifi()">Save &amp; Reboot</button>
+      <button onclick="doReboot()">Reboot</button>
     </div>
   </div>
+
 </div>
 <script>
-async function req(path, body){
-  const res = await fetch(path,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(body||{})});
-  if(!res.ok) throw new Error(await res.text());
-  return await res.json();
-}
-function two(n){return String(n).padStart(2,'0')}
-function draw(s){
-  document.getElementById('status').innerHTML =
-    `<span class="pill">Mode: ${s.autoMode?'AUTO':'MANUAL'}</span>`+
-    `<span class="pill">Valve: ${s.valveOn?'ON':'OFF'}</span>`+
-    `<span class="pill">WiFi: ${s.wifiConnected?'STA':'AP'}</span><br>`+
-    `IP: ${s.ip} | Uptime: ${s.uptimeSec}s<br>`+
-    `Now: ${s.localTime} | Next schedule: ${two(s.scheduleHour)}:${two(s.scheduleMinute)} (${s.scheduleEnabled?'ENABLED':'DISABLED'})`;
-  document.getElementById('schEnabled').value = s.scheduleEnabled?1:0;
+const two = n => String(n).padStart(2,'0');
+
+function draw(s) {
+  document.getElementById('ver').textContent = s.version || '';
+
+  const mode = s.autoMode
+    ? '<span class="pill ok">AUTO</span>'
+    : '<span class="pill warn">MANUAL</span>';
+  const valve = s.valveOn
+    ? '<span class="pill ok">Valve ON</span>'
+    : '<span class="pill">Valve OFF</span>';
+  const net = s.wifiConnected
+    ? `<span class="pill ok">STA</span>`
+    : '<span class="pill warn">AP</span>';
+  const ntp = s.ntpSynced ? '' : '<span class="pill warn">NTP unsynced</span>';
+  const rssi = s.wifiConnected ? ` <span class="dim">${s.rssi} dBm</span>` : '';
+  const rt = s.valveOn && s.valveRuntimeSec > 0
+    ? ` <span class="dim">${s.valveRuntimeSec}s / ${s.maxRuntimeSec}s cap</span>`
+    : '';
+  const lw = s.lastWateredSec > 0
+    ? `<br><span class="dim">Last watered: ${s.lastWateredSec}s ago</span>`
+    : '';
+  const sch = s.scheduleEnabled
+    ? `<br><span class="dim">Daily: ${two(s.scheduleHour)}:${two(s.scheduleMinute)}, ${s.scheduleDurationSec}s</span>`
+    : '';
+
+  document.getElementById('sb').innerHTML =
+    `${mode}${valve}${net}${ntp}${rssi}${rt}${lw}` +
+    `<br><span class="dim">IP: ${s.ip} · Uptime: ${s.uptimeSec}s · ${s.localTime}</span>${sch}`;
+
+  // Runtime progress bar
+  const bar  = document.getElementById('rtbar');
+  const fill = document.getElementById('rtfill');
+  if (s.valveOn && s.valveRuntimeSec > 0) {
+    bar.style.display = 'block';
+    const pct = Math.min(100, (s.valveRuntimeSec / s.maxRuntimeSec) * 100);
+    fill.style.width = pct + '%';
+    fill.style.background = pct > 80 ? 'var(--bad)' : pct > 55 ? 'var(--warn)' : 'var(--ok)';
+  } else {
+    bar.style.display = 'none';
+  }
+
+  document.getElementById('schEnabled').value = s.scheduleEnabled ? '1' : '0';
   document.getElementById('schTime').value = `${two(s.scheduleHour)}:${two(s.scheduleMinute)}`;
   document.getElementById('schDuration').value = s.scheduleDurationSec;
   document.getElementById('maxRuntime').value = s.maxRuntimeSec;
   document.getElementById('tzOffset').value = s.timezoneOffsetMinutes;
 }
-async function refresh(){
-  const s = await (await fetch('/api/status')).json();
-  draw(s);
+
+async function req(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(body || {})
+  });
+  if (!r.ok) { alert('Error: ' + await r.text()); throw new Error(); }
+  return r.json();
 }
-async function valve(state){ await req('/api/valve/'+state,{}); await refresh(); }
-async function setMode(mode){ await req('/api/mode',{mode}); await refresh(); }
-async function saveSchedule(){
+
+async function refresh() {
+  try {
+    const s = await (await fetch('/api/status')).json();
+    draw(s);
+  } catch (_) {
+    document.getElementById('sb').innerHTML =
+      '<span style="color:var(--bad)">⚠ Connection lost…</span>';
+  }
+}
+
+async function valve(state) {
+  try { await req('/api/valve/' + state, {}); await refresh(); } catch (_) {}
+}
+async function setMode(m) {
+  try { await req('/api/mode', { mode: m }); await refresh(); } catch (_) {}
+}
+async function saveSchedule() {
   const t = document.getElementById('schTime').value || '06:00';
   const [hour, minute] = t.split(':');
-  await req('/api/schedule',{
-    enabled: document.getElementById('schEnabled').value,
-    hour, minute,
-    duration: document.getElementById('schDuration').value,
-    maxRuntime: document.getElementById('maxRuntime').value,
-    tzOffset: document.getElementById('tzOffset').value,
-  });
-  await refresh();
+  try {
+    await req('/api/schedule', {
+      enabled:    document.getElementById('schEnabled').value,
+      hour, minute,
+      duration:   document.getElementById('schDuration').value,
+      maxRuntime: document.getElementById('maxRuntime').value,
+      tzOffset:   document.getElementById('tzOffset').value,
+    });
+    await refresh();
+  } catch (_) {}
 }
-async function saveWifi(){
-  await req('/api/wifi',{
-    ssid: document.getElementById('ssid').value,
-    password: document.getElementById('password').value,
-  });
-  alert('WiFi credentials saved. Device rebooting.');
+async function saveWifi() {
+  const ssid = document.getElementById('ssid').value.trim();
+  if (!ssid) { alert('SSID cannot be empty'); return; }
+  try {
+    await req('/api/wifi', {
+      ssid,
+      password: document.getElementById('wfPass').value,
+    });
+    alert('Credentials saved. Reconnect to your WiFi network then reload.');
+  } catch (_) {}
 }
-async function reboot(){ await req('/api/reboot',{}); }
-setInterval(refresh, 3000); refresh();
+async function doReboot() {
+  if (!confirm('Reboot the controller?')) return;
+  try { await req('/api/reboot', {}); } catch (_) {}
+}
+
+setInterval(refresh, 3000);
+refresh();
 </script>
 </body>
 </html>
@@ -176,66 +286,69 @@ uint8_t configChecksum(const DeviceConfig &cfg) {
 
 void setDefaultConfig() {
   memset(&config, 0, sizeof(config));
-  config.magic = CONFIG_MAGIC;
-  config.autoMode = false;                 // fail-safe startup in MANUAL mode
-  config.scheduleEnabled = false;
-  config.scheduleHour = 6;
-  config.scheduleMinute = 0;
-  config.scheduleDurationSec = 60;
-  config.maxRuntimeSec = 300;
-  config.timezoneOffsetMinutes = 330;      // IST default; editable in UI
+  config.magic                 = CONFIG_MAGIC;
+  config.configVersion         = CONFIG_VERSION;
+  config.autoMode              = false;   // SAFETY: start in MANUAL
+  config.scheduleEnabled       = false;   // SAFETY: schedule off
+  config.scheduleHour          = 6;
+  config.scheduleMinute        = 0;
+  config.scheduleDurationSec   = 60;
+  config.maxRuntimeSec         = 300;    // 5-minute hard cap default
+  config.timezoneOffsetMinutes = 330;    // IST (UTC+5:30)
 }
 
 void persistConfig() {
-  config.magic = CONFIG_MAGIC;
-  config.checksum = 0;
-  config.checksum = configChecksum(config);
+  config.magic         = CONFIG_MAGIC;
+  config.configVersion = CONFIG_VERSION;
+  config.checksum      = 0;
+  config.checksum      = configChecksum(config);
   EEPROM.put(0, config);
   EEPROM.commit();
 }
 
 void loadConfig() {
   EEPROM.get(0, config);
-  if (config.magic != CONFIG_MAGIC) {
+  if (config.magic != CONFIG_MAGIC || config.configVersion != CONFIG_VERSION) {
+    Serial.println("Config: invalid magic/version — resetting to defaults");
     setDefaultConfig();
     persistConfig();
     return;
   }
   uint8_t saved = config.checksum;
-  config.checksum = 0;
-  uint8_t calc = configChecksum(config);
-  config.checksum = saved;
+  uint8_t calc  = configChecksum(config);
   if (saved != calc) {
+    Serial.printf("Config: checksum mismatch (saved=%02X calc=%02X) — resetting\n", saved, calc);
     setDefaultConfig();
     persistConfig();
   }
 }
 
-void valveHardwareOff() {
-  digitalWrite(RELAY_PIN, HIGH);  // LOW-trigger relay: HIGH=OFF
+inline void valveHardwareOff() {
+  digitalWrite(RELAY_PIN, HIGH);  // LOW-trigger: HIGH = relay open = valve closed
 }
 
-void valveHardwareOn() {
-  digitalWrite(RELAY_PIN, LOW);   // LOW-trigger relay: LOW=ON
+inline void valveHardwareOn() {
+  digitalWrite(RELAY_PIN, LOW);   // LOW-trigger: LOW = relay closed = valve open
 }
 
-void setValve(bool on, bool startedByScheduler, const char *reason) {
+void setValve(bool on, bool byScheduler, const char *reason) {
   if (on) {
     if (!runtime.valveOn) {
       valveHardwareOn();
-      runtime.valveOn = true;
-      runtime.startedByScheduler = startedByScheduler;
-      runtime.valveOnSinceMs = millis();
-      Serial.printf("VALVE ON (%s)\n", reason);
+      runtime.valveOn            = true;
+      runtime.startedByScheduler = byScheduler;
+      runtime.valveOnSinceMs     = millis();
+      Serial.printf("[%lu] VALVE ON  reason=%s\n", millis(), reason);
     }
     return;
   }
-
   if (runtime.valveOn) {
     valveHardwareOff();
-    runtime.valveOn = false;
+    uint32_t ranSec = static_cast<uint32_t>(millis() - runtime.valveOnSinceMs) / 1000;
+    runtime.lastValveOffMs     = millis();
+    runtime.valveOn            = false;
     runtime.startedByScheduler = false;
-    Serial.printf("VALVE OFF (%s)\n", reason);
+    Serial.printf("[%lu] VALVE OFF reason=%s ran=%us\n", millis(), reason, ranSec);
   }
 }
 
@@ -245,9 +358,7 @@ bool elapsedMs(uint32_t since, uint32_t interval) {
 
 String localTimeText() {
   time_t now = time(nullptr);
-  if (now < 1700000000) {
-    return String("unsynced");
-  }
+  if (now < 1700000000UL) return String("unsynced");
   struct tm tmNow;
   localtime_r(&now, &tmNow);
   char buf[24];
@@ -255,28 +366,35 @@ String localTimeText() {
   return String(buf);
 }
 
-bool connectStation() {
-  if (strlen(config.ssid) == 0) {
-    return false;
+bool checkNtpSynced() {
+  if (runtime.ntpSynced) return true;
+  if (time(nullptr) >= 1700000000UL) {
+    runtime.ntpSynced = true;
+    Serial.printf("[%lu] NTP synced: %s\n", millis(), localTimeText().c_str());
   }
+  return runtime.ntpSynced;
+}
 
+bool connectStation() {
+  if (strlen(config.ssid) == 0) return false;
+  WiFi.persistent(false);  // don't let SDK clobber its own flash store
   WiFi.mode(WIFI_STA);
   WiFi.hostname("balconipaani");
   WiFi.begin(config.ssid, config.password);
-  Serial.printf("Connecting to WiFi SSID '%s'...\n", config.ssid);
+  Serial.printf("[%lu] WiFi connecting to '%s'...\n", millis(), config.ssid);
 
   uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_CONNECT_TIMEOUT_MS) {
+  while (WiFi.status() != WL_CONNECTED && !elapsedMs(start, WIFI_CONNECT_TIMEOUT_MS)) {
     delay(250);
     yield();
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("WiFi connected. IP=%s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[%lu] WiFi connected  IP=%s  RSSI=%d dBm\n",
+                  millis(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
     return true;
   }
-
-  Serial.println("WiFi connect timeout. Falling back to AP mode.");
+  Serial.printf("[%lu] WiFi timeout — falling back to AP mode\n", millis());
   return false;
 }
 
@@ -285,11 +403,39 @@ void startAccessPointMode() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   dnsServer.start(53, "*", WiFi.softAPIP());
-  Serial.printf("AP mode active: SSID=%s IP=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("[%lu] AP mode: SSID=%s  IP=%s\n",
+                millis(), AP_SSID, WiFi.softAPIP().toString().c_str());
+}
+
+// Periodic reconnect when STA link drops (non-blocking check; retries every 60s).
+void attemptWifiReconnect() {
+  if (apMode) return;
+  if (!elapsedMs(runtime.lastWifiCheckMs, WIFI_RECONNECT_INTERVAL_MS)) return;
+  runtime.lastWifiCheckMs = millis();
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.printf("[%lu] WiFi link lost — reconnecting...\n", millis());
+  WiFi.disconnect();
+  WiFi.begin(config.ssid, config.password);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && !elapsedMs(start, WIFI_CONNECT_TIMEOUT_MS)) {
+    delay(250);
+    yield();
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[%lu] WiFi reconnected  IP=%s\n",
+                  millis(), WiFi.localIP().toString().c_str());
+    startTimeSync();  // re-sync NTP after link recovery
+  } else {
+    Serial.printf("[%lu] WiFi reconnect failed — will retry in %lus\n",
+                  millis(), WIFI_RECONNECT_INTERVAL_MS / 1000);
+  }
 }
 
 void startTimeSync() {
-  configTime(config.timezoneOffsetMinutes * 60, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  configTime(config.timezoneOffsetMinutes * 60L, 0,
+             "pool.ntp.org", "time.nist.gov", "time.google.com");
+  runtime.ntpSynced = false;
 }
 
 String ipAddressForUi() {
@@ -297,21 +443,36 @@ String ipAddressForUi() {
 }
 
 void sendStatusJson() {
-  String json = "{";
-  json += "\"autoMode\":" + String(config.autoMode ? "true" : "false");
-  json += ",\"valveOn\":" + String(runtime.valveOn ? "true" : "false");
-  json += ",\"scheduleEnabled\":" + String(config.scheduleEnabled ? "true" : "false");
-  json += ",\"scheduleHour\":" + String(config.scheduleHour);
-  json += ",\"scheduleMinute\":" + String(config.scheduleMinute);
-  json += ",\"scheduleDurationSec\":" + String(config.scheduleDurationSec);
-  json += ",\"maxRuntimeSec\":" + String(config.maxRuntimeSec);
-  json += ",\"timezoneOffsetMinutes\":" + String(config.timezoneOffsetMinutes);
-  json += ",\"wifiConnected\":" + String(!apMode && WiFi.status() == WL_CONNECTED ? "true" : "false");
-  json += ",\"ip\":\"" + ipAddressForUi() + "\"";
-  json += ",\"uptimeSec\":" + String(millis() / 1000);
-  json += ",\"localTime\":\"" + localTimeText() + "\"";
-  json += "}";
-  server.send(200, "application/json", json);
+  uint32_t valveRuntimeSec = runtime.valveOn
+    ? static_cast<uint32_t>(millis() - runtime.valveOnSinceMs) / 1000
+    : 0;
+  uint32_t lastWateredSec = (runtime.lastValveOffMs > 0)
+    ? static_cast<uint32_t>(millis() - runtime.lastValveOffMs) / 1000
+    : 0;
+  bool wifiOk = !apMode && (WiFi.status() == WL_CONNECTED);
+
+  String j;
+  j.reserve(256);
+  j  = "{\"version\":\"";       j += FIRMWARE_VERSION;
+  j += "\",\"autoMode\":";      j += config.autoMode        ? "true" : "false";
+  j += ",\"valveOn\":";         j += runtime.valveOn        ? "true" : "false";
+  j += ",\"valveRuntimeSec\":"; j += valveRuntimeSec;
+  j += ",\"lastWateredSec\":";  j += lastWateredSec;
+  j += ",\"scheduleEnabled\":"; j += config.scheduleEnabled ? "true" : "false";
+  j += ",\"scheduleHour\":";    j += config.scheduleHour;
+  j += ",\"scheduleMinute\":";  j += config.scheduleMinute;
+  j += ",\"scheduleDurationSec\":"; j += config.scheduleDurationSec;
+  j += ",\"maxRuntimeSec\":";   j += config.maxRuntimeSec;
+  j += ",\"timezoneOffsetMinutes\":"; j += config.timezoneOffsetMinutes;
+  j += ",\"wifiConnected\":";   j += wifiOk ? "true" : "false";
+  j += ",\"rssi\":";            j += wifiOk ? WiFi.RSSI() : 0;
+  j += ",\"ip\":\"";            j += ipAddressForUi();
+  j += "\",\"uptimeSec\":";     j += millis() / 1000;
+  j += ",\"localTime\":\"";     j += localTimeText();
+  j += "\",\"ntpSynced\":";     j += runtime.ntpSynced ? "true" : "false";
+  j += "}";
+
+  server.send(200, "application/json", j);
 }
 
 bool parseIntArg(const String &name, int &out) {
@@ -321,36 +482,28 @@ bool parseIntArg(const String &name, int &out) {
 }
 
 void handleModeSet() {
-  if (!server.hasArg("mode")) {
-    server.send(400, "text/plain", "Missing mode");
-    return;
-  }
+  if (!server.hasArg("mode")) { server.send(400, "text/plain", "Missing mode"); return; }
   String mode = server.arg("mode");
   mode.toLowerCase();
-  if (mode == "auto") {
-    config.autoMode = true;
-  } else if (mode == "manual") {
-    config.autoMode = false;
-  } else {
-    server.send(400, "text/plain", "Invalid mode");
-    return;
-  }
+  if      (mode == "auto")   config.autoMode = true;
+  else if (mode == "manual") config.autoMode = false;
+  else { server.send(400, "text/plain", "Invalid mode"); return; }
   persistConfig();
+  Serial.printf("[%lu] Mode -> %s\n", millis(), mode.c_str());
   sendStatusJson();
 }
 
 void handleScheduleSet() {
   int enabled, hour, minute, duration, maxRuntime, tzOffset;
-  if (!parseIntArg("enabled", enabled) ||
-      !parseIntArg("hour", hour) ||
-      !parseIntArg("minute", minute) ||
-      !parseIntArg("duration", duration) ||
+  if (!parseIntArg("enabled",    enabled)   ||
+      !parseIntArg("hour",       hour)       ||
+      !parseIntArg("minute",     minute)     ||
+      !parseIntArg("duration",   duration)   ||
       !parseIntArg("maxRuntime", maxRuntime) ||
-      !parseIntArg("tzOffset", tzOffset)) {
+      !parseIntArg("tzOffset",   tzOffset)) {
     server.send(400, "text/plain", "Missing schedule args");
     return;
   }
-
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
       duration < 5 || duration > 3600 ||
       maxRuntime < 10 || maxRuntime > 7200 ||
@@ -359,15 +512,16 @@ void handleScheduleSet() {
     server.send(400, "text/plain", "Invalid schedule args");
     return;
   }
-
-  config.scheduleEnabled = enabled > 0;
-  config.scheduleHour = static_cast<uint8_t>(hour);
-  config.scheduleMinute = static_cast<uint8_t>(minute);
-  config.scheduleDurationSec = static_cast<uint16_t>(duration);
-  config.maxRuntimeSec = static_cast<uint16_t>(maxRuntime);
+  config.scheduleEnabled       = enabled > 0;
+  config.scheduleHour          = static_cast<uint8_t>(hour);
+  config.scheduleMinute        = static_cast<uint8_t>(minute);
+  config.scheduleDurationSec   = static_cast<uint16_t>(duration);
+  config.maxRuntimeSec         = static_cast<uint16_t>(maxRuntime);
   config.timezoneOffsetMinutes = static_cast<int16_t>(tzOffset);
   persistConfig();
-  startTimeSync();
+  startTimeSync();  // re-apply TZ offset if changed
+  Serial.printf("[%lu] Schedule: %02d:%02d dur=%us cap=%us tz=%+dmin enabled=%d\n",
+                millis(), hour, minute, duration, maxRuntime, tzOffset, config.scheduleEnabled);
   sendStatusJson();
 }
 
@@ -376,51 +530,41 @@ void handleWifiSet() {
     server.send(400, "text/plain", "Missing wifi args");
     return;
   }
-
   String ssid = server.arg("ssid");
-  String password = server.arg("password");
-  if (ssid.length() < 1 || ssid.length() > 32 || password.length() > 64) {
+  String pass = server.arg("password");
+  if (ssid.length() < 1 || ssid.length() > 32 || pass.length() > 64) {
     server.send(400, "text/plain", "Invalid wifi args");
     return;
   }
-
-  memset(config.ssid, 0, sizeof(config.ssid));
+  memset(config.ssid,     0, sizeof(config.ssid));
   memset(config.password, 0, sizeof(config.password));
-  ssid.toCharArray(config.ssid, sizeof(config.ssid));
-  password.toCharArray(config.password, sizeof(config.password));
-
+  ssid.toCharArray(config.ssid,     sizeof(config.ssid));
+  pass.toCharArray(config.password, sizeof(config.password));
   persistConfig();
   sendStatusJson();
-  delay(500);
-  ESP.restart();
+  runtime.pendingReboot = true;  // reboot after response is flushed
 }
 
 void handleReboot() {
   sendStatusJson();
-  delay(500);
-  ESP.restart();
+  runtime.pendingReboot = true;
 }
 
 void setupRoutes() {
   server.on("/", HTTP_GET, []() {
     server.send_P(200, "text/html", INDEX_HTML);
   });
-  server.on("/api/status", HTTP_GET, sendStatusJson);
-  server.on("/api/valve/on", HTTP_POST, []() {
-    setValve(true, false, "manual_web");
-    sendStatusJson();
-  });
-  server.on("/api/valve/off", HTTP_POST, []() {
-    setValve(false, false, "manual_web");
-    sendStatusJson();
-  });
-  server.on("/api/mode", HTTP_POST, handleModeSet);
-  server.on("/api/schedule", HTTP_POST, handleScheduleSet);
-  server.on("/api/wifi", HTTP_POST, handleWifiSet);
-  server.on("/api/reboot", HTTP_POST, handleReboot);
+  server.on("/api/status",    HTTP_GET,  sendStatusJson);
+  server.on("/api/valve/on",  HTTP_POST, []() { setValve(true,  false, "manual_web"); sendStatusJson(); });
+  server.on("/api/valve/off", HTTP_POST, []() { setValve(false, false, "manual_web"); sendStatusJson(); });
+  server.on("/api/mode",      HTTP_POST, handleModeSet);
+  server.on("/api/schedule",  HTTP_POST, handleScheduleSet);
+  server.on("/api/wifi",      HTTP_POST, handleWifiSet);
+  server.on("/api/reboot",    HTTP_POST, handleReboot);
   server.onNotFound([]() {
     if (apMode) {
-      server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
+      server.sendHeader("Location",
+        String("http://") + WiFi.softAPIP().toString() + "/", true);
       server.send(302, "text/plain", "");
       return;
     }
@@ -428,50 +572,59 @@ void setupRoutes() {
   });
 }
 
+// ── Scheduler + safety watchdog ────────────────────────────────────────────
+// Called every SCHEDULER_TICK_MS from loop(). All time-critical safety
+// decisions live here; HTTP handlers only set intent, never bypass this.
 void runSchedulerAndSafety() {
-  if (!elapsedMs(runtime.lastStatusTickMs, STATUS_POLL_MS)) {
+  if (!elapsedMs(runtime.lastTickMs, SCHEDULER_TICK_MS)) return;
+  runtime.lastTickMs = millis();
+
+  // ① Hard runtime cap — unconditional; cannot be overridden by any UI action.
+  if (runtime.valveOn &&
+      elapsedMs(runtime.valveOnSinceMs,
+                static_cast<uint32_t>(config.maxRuntimeSec) * 1000UL)) {
+    setValve(false, false, "hard_cap");
     return;
   }
-  runtime.lastStatusTickMs = millis();
 
-  if (runtime.valveOn && elapsedMs(runtime.valveOnSinceMs, static_cast<uint32_t>(config.maxRuntimeSec) * 1000UL)) {
-    setValve(false, false, "max_runtime_timeout");
-  }
-
+  // ② Scheduled-run duration limit.
   if (runtime.valveOn && runtime.startedByScheduler &&
-      elapsedMs(runtime.valveOnSinceMs, static_cast<uint32_t>(config.scheduleDurationSec) * 1000UL)) {
-    setValve(false, false, "schedule_duration_complete");
-  }
-
-  if (!config.autoMode || !config.scheduleEnabled || runtime.valveOn) {
+      elapsedMs(runtime.valveOnSinceMs,
+                static_cast<uint32_t>(config.scheduleDurationSec) * 1000UL)) {
+    setValve(false, false, "schedule_complete");
     return;
   }
+
+  // ③ Scheduler gate: all conditions must pass before firing.
+  if (!config.autoMode || !config.scheduleEnabled || runtime.valveOn) return;
+  if (!checkNtpSynced()) return;
 
   time_t now = time(nullptr);
-  if (now < 1700000000) {
-    return;
-  }
-
   struct tm tmNow;
   localtime_r(&now, &tmNow);
-  int32_t dayKey = (tmNow.tm_year * 1000) + tmNow.tm_yday;
-  if (tmNow.tm_hour == config.scheduleHour &&
-      tmNow.tm_min == config.scheduleMinute &&
-      tmNow.tm_sec < 5 &&
-      dayKey != runtime.lastScheduleDayKey) {
+
+  int32_t dayKey = static_cast<int32_t>(tmNow.tm_year) * 1000 + tmNow.tm_yday;
+  if (tmNow.tm_hour == config.scheduleHour   &&
+      tmNow.tm_min  == config.scheduleMinute &&
+      tmNow.tm_sec  <  SCHEDULE_WINDOW_SEC   &&
+      dayKey        != runtime.lastScheduleDayKey) {
     runtime.lastScheduleDayKey = dayKey;
     setValve(true, true, "daily_schedule");
   }
 }
 
+// ── Setup ──────────────────────────────────────────────────────────────────
 void setup() {
+  // CRITICAL: Drive relay OFF BEFORE anything else — safe boot guarantee.
   pinMode(RELAY_PIN, OUTPUT);
-  valveHardwareOff();            // SAFETY: keep valve OFF during boot
+  valveHardwareOff();
 
   Serial.begin(115200);
   delay(10);
   Serial.println();
-  Serial.println("BalconiPaani MVP2 boot");
+  Serial.printf("=== BalconiPaani %s ===\n", FIRMWARE_VERSION);
+  Serial.printf("Reset reason : %s\n", ESP.getResetReason().c_str());
+  Serial.printf("Free heap    : %u bytes\n", ESP.getFreeHeap());
 
   EEPROM.begin(EEPROM_BYTES);
   loadConfig();
@@ -480,16 +633,22 @@ void setup() {
     startAccessPointMode();
   }
   startTimeSync();
-
   setupRoutes();
   server.begin();
-  Serial.println("HTTP server started");
+  Serial.printf("[%lu] HTTP server ready\n", millis());
 }
 
+// ── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
   server.handleClient();
-  if (apMode) {
-    dnsServer.processNextRequest();
-  }
+  if (apMode) dnsServer.processNextRequest();
+  attemptWifiReconnect();
   runSchedulerAndSafety();
+
+  // Deferred reboot: response already flushed, safe to restart now.
+  if (runtime.pendingReboot) {
+    valveHardwareOff();  // safety: ensure valve off before restart
+    delay(500);
+    ESP.restart();
+  }
 }
