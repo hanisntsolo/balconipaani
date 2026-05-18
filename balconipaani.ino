@@ -407,6 +407,8 @@ bool checkNtpSynced() {
   return runtime.ntpSynced;
 }
 
+void startTimeSync();  // forward declaration
+
 bool connectStation() {
   if (strlen(config.ssid) == 0) return false;
   WiFi.persistent(false);  // don't let SDK clobber its own flash store
