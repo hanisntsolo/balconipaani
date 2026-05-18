@@ -414,7 +414,6 @@ void startTimeSync();  // forward declaration
 
 bool connectStation() {
   if (strlen(config.ssid) == 0) return false;
-  WiFi.persistent(false);  // don't let SDK clobber its own flash store
   WiFi.mode(WIFI_STA);
   WiFi.hostname("balconipaani");
   WiFi.begin(config.ssid, config.password);
@@ -667,6 +666,16 @@ void setup() {
   Serial.printf("=== BalconiPaani %s ===\n", FIRMWARE_VERSION);
   Serial.printf("Reset reason : %s\n", ESP.getResetReason().c_str());
   Serial.printf("Free heap    : %u bytes\n", ESP.getFreeHeap());
+
+  // Neutralise ESP8266 SDK auto-connect BEFORE any WiFi call.
+  // The SDK stores credentials in its own flash region and auto-connects at
+  // boot regardless of our EEPROM logic unless we explicitly disable it.
+  WiFi.persistent(false);      // never let SDK write to its own flash
+  WiFi.setAutoConnect(false);  // don't auto-connect on next power-up
+  WiFi.setAutoReconnect(false);// don't background-reconnect behind our back
+  WiFi.disconnect(true);       // disconnect + wipe any SDK-stored credentials
+  WiFi.mode(WIFI_OFF);
+  delay(100);
 
   EEPROM.begin(EEPROM_BYTES);
   loadConfig();
