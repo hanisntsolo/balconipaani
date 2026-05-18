@@ -355,12 +355,15 @@ void loadConfig() {
   }
 }
 
+// Relay wired to NC terminal: coil must be ENERGISED (LOW) to open NC contact and cut solenoid power.
+// WARNING: if ESP loses power the pin goes Hi-Z, relay de-energises, NC closes, solenoid
+// gets power and the valve opens. Wire to NO terminal for true fail-safe behaviour.
 inline void valveHardwareOff() {
-  digitalWrite(RELAY_PIN, HIGH);  // LOW-trigger: HIGH = relay open = valve closed
+  digitalWrite(RELAY_PIN, LOW);   // energise relay → NC opens → solenoid OFF → valve CLOSED
 }
 
 inline void valveHardwareOn() {
-  digitalWrite(RELAY_PIN, LOW);   // LOW-trigger: LOW = relay closed = valve open
+  digitalWrite(RELAY_PIN, HIGH);  // de-energise relay → NC closes → solenoid ON → valve OPEN
 }
 
 void setValve(bool on, bool byScheduler, const char *reason) {
