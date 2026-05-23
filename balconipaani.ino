@@ -13,7 +13,9 @@
 #include <EEPROM.h>
 #include <time.h>
 #include <ArduinoOTA.h>
-#include <Updater.h>
+#ifndef UPDATE_SIZE_UNKNOWN
+#define UPDATE_SIZE_UNKNOWN 0xFFFFFFFF
+#endif
 
 // ── Firmware identity ──────────────────────────────────────────────────────
 constexpr char     FIRMWARE_VERSION[]         = "MVP3.0";
