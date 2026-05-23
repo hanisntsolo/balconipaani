@@ -703,6 +703,13 @@ void handleScheduleSet() {
       server.send(400, "text/plain", "Invalid slot args");
       return;
     }
+    // If the scheduled time changed and the slot already fired today,
+    // clear its bit so it can fire again at the new time.
+    if (config.slots[i].hour != static_cast<uint8_t>(hour) ||
+        config.slots[i].minute != static_cast<uint8_t>(minute)) {
+      runtime.slotsFiredToday &= ~(1 << i);
+      Serial.printf("[%lu] Slot %u time changed → fired-bit cleared\n", millis(), i);
+    }
     config.slots[i].enabled     = enabled > 0;
     config.slots[i].hour        = static_cast<uint8_t>(hour);
     config.slots[i].minute      = static_cast<uint8_t>(minute);
@@ -952,7 +959,9 @@ void runSchedulerAndSafety() {
       Serial.printf("[%lu] skipToday cleared for new day\n", millis());
     }
     if (dayKey != runtime.lastScheduleDayKey) {
-      runtime.slotsFiredToday = 0;  // new day — all slots may fire again
+      Serial.printf("[%lu] Day rollover: slotsFiredToday reset (was 0x%02X)\n",
+                    millis(), runtime.slotsFiredToday);
+      runtime.slotsFiredToday    = 0;
       runtime.lastScheduleDayKey = dayKey;
     }
   }
@@ -1008,6 +1017,19 @@ void setup() {
 
   EEPROM.begin(EEPROM_BYTES);
   loadConfig();
+
+  // Scheduler boot state — confirms fresh runtime (slotsFiredToday always 0 at boot)
+  Serial.printf("Scheduler   : autoMode=%s  slotsFiredToday=0x%02X (fresh boot)\n",
+                config.autoMode ? "AUTO" : "MANUAL", runtime.slotsFiredToday);
+  for (uint8_t i = 0; i < 3; i++) {
+    Serial.printf("  Slot %u     : %s  %02u:%02u  %us\n",
+                  i,
+                  config.slots[i].enabled ? "ENABLED " : "disabled",
+                  config.slots[i].hour, config.slots[i].minute,
+                  config.slots[i].durationSec);
+  }
+  Serial.printf("  maxRuntime : %us  tz=%+dmin  ntp=%s\n",
+                config.maxRuntimeSec, config.timezoneOffsetMinutes, config.ntpServer);
 
   if (!connectStation()) {
     startAccessPointMode();
