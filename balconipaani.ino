@@ -78,7 +78,8 @@ struct RuntimeState {
   bool     startedByScheduler;
   uint16_t scheduledDurationSec;  // snapshot of slot durationSec at fire time
   uint32_t valveOnSinceMs;
-  int32_t  lastScheduleDayKey;
+  int32_t  lastScheduleDayKey;    // tracks current day for per-slot bitmask reset
+  uint8_t  slotsFiredToday;       // bit N = slot N has already fired today
   int32_t  lastSeenDayKey;        // for skipToday auto-clear on day rollover
   uint32_t lastTickMs;
   uint32_t lastWifiCheckMs;
@@ -943,29 +944,35 @@ void runSchedulerAndSafety() {
   localtime_r(&now, &tmNow);
   int32_t dayKey = static_cast<int32_t>(tmNow.tm_year) * 1000 + tmNow.tm_yday;
 
-  // Auto-clear skipToday on day rollover
-  if (runtime.lastSeenDayKey != 0 && dayKey != runtime.lastSeenDayKey && config.skipToday) {
-    config.skipToday = false;
-    persistConfig();
-    Serial.printf("[%lu] skipToday cleared for new day\n", millis());
+  // Auto-clear skipToday and per-slot fired bitmask on day rollover
+  if (runtime.lastSeenDayKey != 0 && dayKey != runtime.lastSeenDayKey) {
+    if (config.skipToday) {
+      config.skipToday = false;
+      persistConfig();
+      Serial.printf("[%lu] skipToday cleared for new day\n", millis());
+    }
+    if (dayKey != runtime.lastScheduleDayKey) {
+      runtime.slotsFiredToday = 0;  // new day — all slots may fire again
+      runtime.lastScheduleDayKey = dayKey;
+    }
   }
   runtime.lastSeenDayKey = dayKey;
 
   if (config.skipToday) return;
 
-  // Loop all 3 slots; fire the first matching one per day
+  // Loop all 3 slots; each fires independently once per day via per-slot bitmask
   for (uint8_t i = 0; i < 3; i++) {
     if (!config.slots[i].enabled) continue;
+    if (runtime.slotsFiredToday & (1 << i)) continue;  // already fired today
     if (tmNow.tm_hour == config.slots[i].hour   &&
         tmNow.tm_min  == config.slots[i].minute &&
-        tmNow.tm_sec  <  SCHEDULE_WINDOW_SEC    &&
-        dayKey        != runtime.lastScheduleDayKey) {
-      runtime.lastScheduleDayKey   = dayKey;
-      runtime.scheduledDurationSec = config.slots[i].durationSec;
+        tmNow.tm_sec  <  SCHEDULE_WINDOW_SEC) {
+      runtime.slotsFiredToday      |= (1 << i);
+      runtime.scheduledDurationSec  = config.slots[i].durationSec;
       char label[20];
       snprintf(label, sizeof(label), "slot%u_schedule", i);
       setValve(true, true, label);
-      break;  // only fire once per scheduler tick
+      break;  // start one slot; next will fire at its own time
     }
   }
 }
