@@ -13,6 +13,7 @@
 #include <EEPROM.h>
 #include <time.h>
 #include <ArduinoOTA.h>
+#include <LittleFS.h>
 #ifndef UPDATE_SIZE_UNKNOWN
 #define UPDATE_SIZE_UNKNOWN 0xFFFFFFFF
 #endif
@@ -88,16 +89,9 @@ struct RuntimeState {
   bool     pendingReboot;         // defers ESP.restart() out of HTTP handler
 };
 
-// ── Watering history (RAM circular buffer, most-recent-first on read) ───────
-struct WaterHistoryEntry {
-  time_t   ts;
-  uint16_t durationSec;
-  char     reason[16];
-};
-constexpr uint8_t HISTORY_SIZE = 10;
-static WaterHistoryEntry historyBuf[HISTORY_SIZE];
-static uint8_t historyHead  = 0;  // next write position
-static uint8_t historyCount = 0;
+// ── Watering history (LittleFS-backed, 30-record rotating CSV) ───────────────
+constexpr uint8_t  HISTORY_MAX  = 30;
+constexpr char     HISTORY_FILE[] = "/history.csv";   // ts,durationSec,reason\n
 
 ESP8266WebServer server(80);
 DNSServer        dnsServer;
@@ -490,6 +484,48 @@ void loadConfig() {
   }
 }
 
+// ── Persistent history (LittleFS rotating CSV) ────────────────────────────────
+// Appends one CSV line. Keeps the file at most HISTORY_MAX lines by rewriting
+// (dropping the oldest entry) when the cap is reached. ~1.5 KB max on flash.
+void appendHistory(time_t ts, uint16_t durationSec, const char *reason) {
+  // Sanitize reason: strip commas to protect CSV structure.
+  char safeReason[17];
+  strncpy(safeReason, reason, sizeof(safeReason) - 1);
+  safeReason[sizeof(safeReason) - 1] = '\0';
+  for (char *p = safeReason; *p; p++) if (*p == ',') *p = '-';
+
+  // Read existing lines (up to HISTORY_MAX).
+  String lines[HISTORY_MAX];
+  uint8_t count = 0;
+  File f = LittleFS.open(HISTORY_FILE, "r");
+  if (f) {
+    while (f.available() && count < HISTORY_MAX) {
+      String ln = f.readStringUntil('\n');
+      ln.trim();
+      if (ln.length() > 0) lines[count++] = ln;
+    }
+    f.close();
+  }
+
+  // Rewrite file: if full, drop oldest (lines[0]); then append new entry.
+  File out = LittleFS.open(HISTORY_FILE, "w");
+  if (!out) {
+    Serial.printf("[%lu] History: LittleFS open for write failed\n", millis());
+    return;
+  }
+  uint8_t start = (count >= HISTORY_MAX) ? 1 : 0;
+  for (uint8_t i = start; i < count; i++) {
+    out.println(lines[i]);
+  }
+  char newLine[64];
+  snprintf(newLine, sizeof(newLine), "%lu,%u,%s",
+           static_cast<unsigned long>(ts), durationSec, safeReason);
+  out.println(newLine);
+  out.close();
+  Serial.printf("[%lu] History: appended [%s] → %u entries stored\n",
+                millis(), newLine, min((uint8_t)(count - start + 1), HISTORY_MAX));
+}
+
 // Relay wired to NC terminal: coil must be ENERGISED (LOW) to open NC contact and cut solenoid power.
 // WARNING: if ESP loses power the pin goes Hi-Z, relay de-energises, NC closes, solenoid
 // gets power and the valve opens. Wire to NO terminal for true fail-safe behaviour.
@@ -515,14 +551,7 @@ void setValve(bool on, bool byScheduler, const char *reason) {
   if (runtime.valveOn) {
     valveHardwareOff();
     uint32_t ranSec = static_cast<uint32_t>(millis() - runtime.valveOnSinceMs) / 1000;
-    // Record to circular history buffer
-    WaterHistoryEntry &e = historyBuf[historyHead];
-    e.ts          = time(nullptr);
-    e.durationSec = static_cast<uint16_t>(ranSec);
-    strncpy(e.reason, reason, sizeof(e.reason) - 1);
-    e.reason[sizeof(e.reason) - 1] = '\0';
-    historyHead = (historyHead + 1) % HISTORY_SIZE;
-    if (historyCount < HISTORY_SIZE) historyCount++;
+    appendHistory(time(nullptr), static_cast<uint16_t>(ranSec), reason);
     runtime.lastValveOffMs     = millis();
     runtime.valveOn            = false;
     runtime.startedByScheduler = false;
@@ -792,16 +821,33 @@ void handleOtaPassword() {
 }
 
 void handleHistory() {
+  // Read CSV file; output most-recent-first JSON array.
+  String lines[HISTORY_MAX];
+  uint8_t count = 0;
+  File f = LittleFS.open(HISTORY_FILE, "r");
+  if (f) {
+    while (f.available() && count < HISTORY_MAX) {
+      String ln = f.readStringUntil('\n');
+      ln.trim();
+      if (ln.length() > 0) lines[count++] = ln;
+    }
+    f.close();
+  }
+
   String j;
-  j.reserve(512);
+  j.reserve(static_cast<uint16_t>(count) * 72 + 4);
   j = "[";
-  for (uint8_t i = 0; i < historyCount; i++) {
-    // Walk backwards from historyHead → most-recent first
-    uint8_t idx = (historyHead + HISTORY_SIZE - 1 - i) % HISTORY_SIZE;
-    if (i > 0) j += ",";
-    j += "{\"ts\":";          j += static_cast<uint32_t>(historyBuf[idx].ts);
-    j += ",\"durationSec\":"; j += historyBuf[idx].durationSec;
-    j += ",\"reason\":\"";    j += String(historyBuf[idx].reason);
+  bool first = true;
+  for (int8_t i = static_cast<int8_t>(count) - 1; i >= 0; i--) {
+    // CSV: ts,durationSec,reason
+    int c1 = lines[i].indexOf(',');
+    int c2 = lines[i].indexOf(',', c1 + 1);
+    if (c1 < 0 || c2 < 0) continue;
+    if (!first) j += ",";
+    first = false;
+    j += "{\"ts\":";          j += lines[i].substring(0, c1);
+    j += ",\"durationSec\":"; j += lines[i].substring(c1 + 1, c2);
+    j += ",\"reason\":\"";    j += lines[i].substring(c2 + 1);
     j += "\"}";
   }
   j += "]";
@@ -1017,6 +1063,15 @@ void setup() {
 
   EEPROM.begin(EEPROM_BYTES);
   loadConfig();
+
+  // Mount LittleFS (format on first boot if not yet formatted).
+  if (!LittleFS.begin()) {
+    Serial.printf("[%lu] LittleFS: mount failed, formatting...\n", millis());
+    LittleFS.format();
+    LittleFS.begin();
+  }
+  Serial.printf("[%lu] LittleFS: mounted OK  history=%s\n",
+                millis(), LittleFS.exists(HISTORY_FILE) ? "exists" : "new");
 
   // Scheduler boot state — confirms fresh runtime (slotsFiredToday always 0 at boot)
   Serial.printf("Scheduler   : autoMode=%s  slotsFiredToday=0x%02X (fresh boot)\n",
