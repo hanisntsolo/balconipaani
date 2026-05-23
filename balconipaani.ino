@@ -318,15 +318,20 @@ function draw(s) {
     wifiForm.style.display = 'block';
   }
 
-  const dSlots = slots.length === 3 ? slots : [{hour:6,minute:0,durationSec:60,enabled:false},{hour:0,minute:0,durationSec:60,enabled:false},{hour:0,minute:0,durationSec:60,enabled:false}];
-  for (let i = 0; i < 3; i++) {
-    document.getElementById('s' + i + 'e').value = dSlots[i].enabled ? '1' : '0';
-    document.getElementById('s' + i + 't').value = two(dSlots[i].hour) + ':' + two(dSlots[i].minute);
-    document.getElementById('s' + i + 'd').value = dSlots[i].durationSec;
+  // Only sync schedule fields when the user is not actively editing them.
+  const schedIds = ['s0e','s0t','s0d','s1e','s1t','s1d','s2e','s2t','s2d','maxRuntime','tzOffset','ntpServer'];
+  const editingSchedule = schedIds.some(id => document.getElementById(id) === document.activeElement);
+  if (!editingSchedule) {
+    const dSlots = slots.length === 3 ? slots : [{hour:6,minute:0,durationSec:60,enabled:false},{hour:0,minute:0,durationSec:60,enabled:false},{hour:0,minute:0,durationSec:60,enabled:false}];
+    for (let i = 0; i < 3; i++) {
+      document.getElementById('s' + i + 'e').value = dSlots[i].enabled ? '1' : '0';
+      document.getElementById('s' + i + 't').value = two(dSlots[i].hour) + ':' + two(dSlots[i].minute);
+      document.getElementById('s' + i + 'd').value = dSlots[i].durationSec;
+    }
+    document.getElementById('maxRuntime').value = s.maxRuntimeSec;
+    document.getElementById('tzOffset').value   = s.timezoneOffsetMinutes;
+    if (s.ntpServer) document.getElementById('ntpServer').value = s.ntpServer;
   }
-  document.getElementById('maxRuntime').value = s.maxRuntimeSec;
-  document.getElementById('tzOffset').value   = s.timezoneOffsetMinutes;
-  if (s.ntpServer) document.getElementById('ntpServer').value = s.ntpServer;
 
   _skipToday = !!s.skipToday;
   const skipBtn = document.getElementById('skipBtn');
