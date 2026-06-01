@@ -592,6 +592,9 @@ void saveAlexaConfig() {
   f.close();
 }
 
+// Forward declaration needed: alexaCallback is placed before setValve in file order.
+void setValve(bool on, bool byScheduler, const char *reason);
+
 // ── Alexa device callback ──────────────────────────────────────────────────────
 // brightness==0 → Alexa said "off"; any other value → "on"
 void alexaCallback(uint8_t brightness) {
@@ -1207,7 +1210,7 @@ void setup() {
   // Espalexa (Alexa local discovery + control) — STA mode only
   if (!apMode) {
     loadAlexaConfig();
-    espalexa.addDevice(alexaDeviceName, alexaCallback, EspalexaDeviceType::onoff);
+    espalexa.addDevice(String(alexaDeviceName), alexaCallback, 0);
     espalexa.begin(&server);
     alexaEnabled = true;
     Serial.printf("[%lu] Espalexa ready — device: '%s', dur=%us\n",
