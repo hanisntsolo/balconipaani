@@ -14,6 +14,7 @@
 #include <time.h>
 #include <ArduinoOTA.h>
 #include <LittleFS.h>
+#define ESPALEXA_DEBUG   // print all SSDP traffic to Serial — remove after onboarding is stable
 #include <Espalexa.h>
 #ifndef UPDATE_SIZE_UNKNOWN
 #define UPDATE_SIZE_UNKNOWN 0xFFFFFFFF
@@ -106,6 +107,13 @@ bool alexaEnabled = false;
 // Alexa device name and duration — loaded from LittleFS /alexa.cfg at boot
 static char     alexaDeviceName[33] = "balconi paani";
 static uint16_t alexaDurationSec    = 120;   // default: 2-minute Alexa-triggered run
+
+// Discovery mode: sends proactive SSDP NOTIFY for 2 min so Alexa can find the device.
+static bool     alexaDiscoveryActive    = false;
+static uint32_t alexaDiscoveryEndMs     = 0;
+static uint32_t alexaLastNotifyMs       = 0;
+static const uint32_t ALEXA_DISC_MS            = 120000UL; // 2-minute window
+static const uint32_t ALEXA_NOTIFY_INTERVAL_MS =  10000UL; // SSDP NOTIFY every 10 s
 
 // OTA upload abort flag (set when valve is ON at upload start)
 static bool otaUploadAborted = false;
@@ -255,12 +263,19 @@ details[open]>summary::before{content:"▼ "}
   <div class="card">
     <h2>Alexa</h2>
     <div id="alexa-status" class="dim" style="margin-bottom:8px">Loading…</div>
+    <div id="alexa-disc-status" style="display:none;margin-bottom:8px"></div>
     <label>Device Name <span class="dim">(say "Alexa, turn on [name]")</span></label>
     <input id="alexaName" type="text" maxlength="32" placeholder="balconi paani">
     <label style="margin-top:8px">Alexa-triggered duration (sec)</label>
     <input id="alexaDur" type="number" min="5" max="3600" placeholder="120">
     <div class="dim" style="margin-top:4px">How long the valve runs when Alexa turns it on. Hard cap still applies.</div>
-    <div class="row"><button onclick="saveAlexaConfig()">Save Alexa Config</button></div>
+    <div class="row" style="gap:8px">
+      <button onclick="saveAlexaConfig()">Save &amp; Start Discovery</button>
+      <button onclick="startAlexaDiscovery()" style="background:#555">Start Discovery Only</button>
+    </div>
+    <div class="dim" style="margin-top:6px;font-size:0.85em">
+      After saving or pressing discovery: open <strong>Alexa app → Devices → ＋ → Other → Discover Devices</strong>
+    </div>
   </div>
 
   <div class="card">
@@ -356,8 +371,18 @@ function draw(s) {
   const alexaStatusEl = document.getElementById('alexa-status');
   if (alexaStatusEl) {
     alexaStatusEl.innerHTML = s.alexaEnabled
-      ? '<span class="pill ok">Alexa: Active</span> <span class="dim">Say "Alexa, discover devices" to onboard.</span>'
+      ? '<span class="pill ok">Alexa: Active</span>'
       : '<span class="pill warn">Alexa: Unavailable (AP mode)</span>';
+    const discEl = document.getElementById('alexa-disc-status');
+    if (discEl) {
+      if (s.alexaDiscoveryActive && s.alexaDiscoverySecondsLeft > 0) {
+        discEl.style.display = '';
+        discEl.innerHTML = '<span class="pill ok">&#128225; Discovery OPEN — ' + s.alexaDiscoverySecondsLeft +
+          ' s left</span> <span class="dim">Open Alexa app → Devices → ＋ → Other → Discover Devices</span>';
+      } else {
+        discEl.style.display = 'none';
+      }
+    }
     const nameEl = document.getElementById('alexaName');
     const durEl  = document.getElementById('alexaDur');
     if (nameEl && nameEl !== document.activeElement) nameEl.value = s.alexaDeviceName || 'balconi paani';
@@ -442,7 +467,13 @@ async function saveAlexaConfig() {
   if (!name) { alert('Device name cannot be empty'); return; }
   try {
     await req('/api/alexa-config', { name, duration: dur });
-    alert('Alexa config saved.\nSay "Alexa, discover devices" to (re-)onboard.\nA reboot may be needed if you renamed the device.');
+    // Discovery starts automatically on the device; the countdown will appear in the status bar.
+  } catch (_) {}
+}
+
+async function startAlexaDiscovery() {
+  try {
+    await req('/api/alexa-discover', {});
   } catch (_) {}
 }
 
@@ -590,6 +621,45 @@ void saveAlexaConfig() {
   f.println(alexaDeviceName);
   f.println(alexaDurationSec);
   f.close();
+}
+
+// Send a proactive SSDP NOTIFY * (ssdp:alive) to the multicast group so Alexa can find
+// the device without waiting for an M-SEARCH.  UUID must match Espalexa's scheme:
+// "38323636-4558-4dda-9188-" + lowercase MAC without colons.
+void sendSsdpAlive() {
+  String mac = WiFi.macAddress();
+  mac.replace(":", "");
+  mac.toLowerCase();
+  String uuid = "38323636-4558-4dda-9188-" + mac;
+  String myIP = WiFi.localIP().toString();
+
+  String pkt =
+    "NOTIFY * HTTP/1.1\r\n"
+    "HOST: 239.255.255.250:1900\r\n"
+    "CACHE-CONTROL: max-age=100\r\n"
+    "LOCATION: http://" + myIP + "/description.xml\r\n"
+    "SERVER: FreeRTOS/6.0.5, UPnP/1.0, IpBridge/1.17.0\r\n"
+    "NTS: ssdp:alive\r\n"
+    "NT: upnp:rootdevice\r\n"
+    "USN: uuid:" + uuid + "::upnp:rootdevice\r\n\r\n";
+
+  WiFiUDP udpNotify;
+  udpNotify.beginPacketMulticast(IPAddress(239, 255, 255, 250), 1900, WiFi.localIP());
+  udpNotify.print(pkt);
+  udpNotify.endPacket();
+  Serial.printf("[%lu] SSDP NOTIFY sent → http://%s/description.xml uuid=%s\n",
+                millis(), myIP.c_str(), uuid.c_str());
+}
+
+// Start a 2-minute discovery window and send an immediate SSDP NOTIFY.
+// Called automatically after config save and via the /api/alexa-discover endpoint.
+void startAlexaDiscovery() {
+  if (!alexaEnabled) return;
+  alexaDiscoveryActive = true;
+  alexaDiscoveryEndMs  = millis() + ALEXA_DISC_MS;
+  alexaLastNotifyMs    = 0; // force immediate NOTIFY on next loop tick
+  Serial.printf("[%lu] Alexa discovery window OPEN (2 min)\n", millis());
+  Serial.printf("[%lu]   → Alexa app → Devices → + → Other → Discover Devices\n", millis());
 }
 
 // Forward declaration needed: alexaCallback is placed before setValve in file order.
@@ -775,6 +845,11 @@ void sendStatusJson() {
   j += "\",\"alexaEnabled\":";        j += alexaEnabled ? "true" : "false";
   j += ",\"alexaDeviceName\":\"";     j += String(alexaDeviceName);
   j += "\",\"alexaDurationSec\":";    j += alexaDurationSec;
+  { uint32_t left = (alexaDiscoveryActive && alexaDiscoveryEndMs > millis())
+                    ? (alexaDiscoveryEndMs - millis()) / 1000 : 0;
+    j += ",\"alexaDiscoveryActive\":";      j += (left > 0) ? "true" : "false";
+    j += ",\"alexaDiscoverySecondsLeft\":"; j += left;
+  }
   j += "}";
 
   server.send(200, "application/json", j);
@@ -939,6 +1014,13 @@ void handleHistory() {
   server.send(200, "application/json", j);
 }
 
+void handleAlexaDiscover() {
+  startAlexaDiscovery();
+  server.send(200, "application/json",
+    "{\"ok\":true,\"msg\":\"Discovery window open for 2 min. "
+    "Open Alexa app → Devices → + → Other → Discover Devices.\"}");
+}
+
 void handleAlexaConfig() {
   if (!server.hasArg("name") || !server.hasArg("duration")) {
     server.send(400, "text/plain", "Missing args"); return;
@@ -962,6 +1044,7 @@ void handleAlexaConfig() {
     if (dev) dev->setName(String(alexaDeviceName));
   }
   Serial.printf("[%lu] Alexa config: name='%s' dur=%us\n", millis(), alexaDeviceName, alexaDurationSec);
+  startAlexaDiscovery();  // auto-start 2-min discovery window so Alexa sees the updated device
   sendStatusJson();
 }
 
@@ -1046,7 +1129,8 @@ void setupRoutes() {
   server.on("/api/skip-today",  HTTP_POST, handleSkipToday);
   server.on("/api/ota-password",HTTP_POST, handleOtaPassword);
   server.on("/api/history",     HTTP_GET,  handleHistory);
-  server.on("/api/alexa-config",HTTP_POST, handleAlexaConfig);
+  server.on("/api/alexa-config",   HTTP_POST, handleAlexaConfig);
+  server.on("/api/alexa-discover", HTTP_POST, handleAlexaDiscover);
   server.on("/update",          HTTP_GET,  handleOtaGet);
   server.on("/update",          HTTP_POST, handleOtaPost, handleOtaUpload);
   server.onNotFound([]() {
@@ -1247,6 +1331,18 @@ void loop() {
   ArduinoOTA.handle();
   server.handleClient();
   if (alexaEnabled) espalexa.loop();
+
+  // Discovery mode: send proactive SSDP NOTIFY every 10 s; expire after 2 min.
+  if (alexaDiscoveryActive) {
+    uint32_t now = millis();
+    if (now >= alexaDiscoveryEndMs) {
+      alexaDiscoveryActive = false;
+      Serial.printf("[%lu] Alexa discovery window CLOSED\n", now);
+    } else if (now - alexaLastNotifyMs >= ALEXA_NOTIFY_INTERVAL_MS) {
+      alexaLastNotifyMs = now;
+      sendSsdpAlive();
+    }
+  }
   if (apMode) dnsServer.processNextRequest();
   MDNS.update();
   attemptWifiReconnect();
