@@ -371,7 +371,7 @@ function draw(s) {
   const alexaStatusEl = document.getElementById('alexa-status');
   if (alexaStatusEl) {
     alexaStatusEl.innerHTML = s.alexaEnabled
-      ? '<span class="pill ok">Alexa: Active</span>'
+      ? '<span class="pill ok">Alexa: Active</span> <span class="dim">Say "Alexa, discover devices" to onboard.</span>'
       : '<span class="pill warn">Alexa: Unavailable (AP mode)</span>';
     const discEl = document.getElementById('alexa-disc-status');
     if (discEl) {
