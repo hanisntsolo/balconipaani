@@ -14,12 +14,13 @@
 #include <time.h>
 #include <ArduinoOTA.h>
 #include <LittleFS.h>
+#include <Espalexa.h>
 #ifndef UPDATE_SIZE_UNKNOWN
 #define UPDATE_SIZE_UNKNOWN 0xFFFFFFFF
 #endif
 
 // ── Firmware identity ──────────────────────────────────────────────────────
-constexpr char     FIRMWARE_VERSION[]         = "MVP3.0";
+constexpr char     FIRMWARE_VERSION[]         = "MVP4.0";
 
 // ── Hardware ───────────────────────────────────────────────────────────────
 constexpr uint8_t  RELAY_PIN                  = D2;   // LOW-trigger relay
@@ -95,10 +96,16 @@ constexpr char     HISTORY_FILE[] = "/history.csv";   // ts,durationSec,reason\n
 
 ESP8266WebServer server(80);
 DNSServer        dnsServer;
+Espalexa         espalexa;
 
 DeviceConfig config;
 RuntimeState runtime{};
-bool apMode = false;
+bool apMode       = false;
+bool alexaEnabled = false;
+
+// Alexa device name and duration — loaded from LittleFS /alexa.cfg at boot
+static char     alexaDeviceName[33] = "balconi paani";
+static uint16_t alexaDurationSec    = 120;   // default: 2-minute Alexa-triggered run
 
 // OTA upload abort flag (set when valve is ON at upload start)
 static bool otaUploadAborted = false;
@@ -246,6 +253,17 @@ details[open]>summary::before{content:"▼ "}
   </div>
 
   <div class="card">
+    <h2>Alexa</h2>
+    <div id="alexa-status" class="dim" style="margin-bottom:8px">Loading…</div>
+    <label>Device Name <span class="dim">(say "Alexa, turn on [name]")</span></label>
+    <input id="alexaName" type="text" maxlength="32" placeholder="balconi paani">
+    <label style="margin-top:8px">Alexa-triggered duration (sec)</label>
+    <input id="alexaDur" type="number" min="5" max="3600" placeholder="120">
+    <div class="dim" style="margin-top:4px">How long the valve runs when Alexa turns it on. Hard cap still applies.</div>
+    <div class="row"><button onclick="saveAlexaConfig()">Save Alexa Config</button></div>
+  </div>
+
+  <div class="card">
     <h2>Watering History</h2>
     <details id="hist-det">
       <summary onclick="loadHistory(this)">Show last 10 sessions</summary>
@@ -334,6 +352,17 @@ function draw(s) {
   skipBtn.className   = 'sm' + (s.skipToday ? ' warn' : '');
   document.getElementById('skipStatus').textContent =
     s.skipToday ? '\u26a0 Scheduled watering skipped for today' : '';
+
+  const alexaStatusEl = document.getElementById('alexa-status');
+  if (alexaStatusEl) {
+    alexaStatusEl.innerHTML = s.alexaEnabled
+      ? '<span class="pill ok">Alexa: Active</span> <span class="dim">Say "Alexa, discover devices" to onboard.</span>'
+      : '<span class="pill warn">Alexa: Unavailable (AP mode)</span>';
+    const nameEl = document.getElementById('alexaName');
+    const durEl  = document.getElementById('alexaDur');
+    if (nameEl && nameEl !== document.activeElement) nameEl.value = s.alexaDeviceName || 'balconi paani';
+    if (durEl  && durEl  !== document.activeElement) durEl.value  = s.alexaDurationSec || 120;
+  }
 }
 
 async function req(path, body) {
@@ -404,6 +433,16 @@ async function saveOtaPassword() {
     await req('/api/ota-password', { password: pw });
     document.getElementById('otaPw').value = '';
     alert('OTA password saved.\nArduino IDE OTA will use the new password on next push.');
+  } catch (_) {}
+}
+
+async function saveAlexaConfig() {
+  const name = document.getElementById('alexaName').value.trim();
+  const dur  = document.getElementById('alexaDur').value;
+  if (!name) { alert('Device name cannot be empty'); return; }
+  try {
+    await req('/api/alexa-config', { name, duration: dur });
+    alert('Alexa config saved.\nSay "Alexa, discover devices" to (re-)onboard.\nA reboot may be needed if you renamed the device.');
   } catch (_) {}
 }
 
@@ -524,6 +563,46 @@ void appendHistory(time_t ts, uint16_t durationSec, const char *reason) {
   out.close();
   Serial.printf("[%lu] History: appended [%s] → %u entries stored\n",
                 millis(), newLine, min((uint8_t)(count - start + 1), HISTORY_MAX));
+}
+
+// ── Alexa config (LittleFS /alexa.cfg) ────────────────────────────────────────
+// Format: line1 = device name, line2 = duration seconds
+void loadAlexaConfig() {
+  File f = LittleFS.open("/alexa.cfg", "r");
+  if (!f) return;
+  String name = f.readStringUntil('\n');
+  name.trim();
+  if (name.length() > 0 && name.length() < sizeof(alexaDeviceName)) {
+    memset(alexaDeviceName, 0, sizeof(alexaDeviceName));
+    name.toCharArray(alexaDeviceName, sizeof(alexaDeviceName));
+  }
+  String durStr = f.readStringUntil('\n');
+  int d = durStr.toInt();
+  if (d >= 5 && d <= 3600) alexaDurationSec = static_cast<uint16_t>(d);
+  f.close();
+  Serial.printf("[%lu] Alexa config loaded: name='%s' dur=%us\n",
+                millis(), alexaDeviceName, alexaDurationSec);
+}
+
+void saveAlexaConfig() {
+  File f = LittleFS.open("/alexa.cfg", "w");
+  if (!f) { Serial.printf("[%lu] Alexa: LittleFS write failed\n", millis()); return; }
+  f.println(alexaDeviceName);
+  f.println(alexaDurationSec);
+  f.close();
+}
+
+// ── Alexa device callback ──────────────────────────────────────────────────────
+// brightness==0 → Alexa said "off"; any other value → "on"
+void alexaCallback(uint8_t brightness) {
+  if (brightness == 0) {
+    setValve(false, false, "alexa_off");
+  } else {
+    // Reuse the scheduler timed-auto-off mechanism: valve closes after alexaDurationSec.
+    // The hard cap (maxRuntimeSec) remains the unconditional backstop.
+    runtime.scheduledDurationSec = alexaDurationSec;
+    setValve(true, true, "alexa_on");
+  }
 }
 
 // Relay wired to NC terminal: coil must be ENERGISED (LOW) to open NC contact and cut solenoid power.
@@ -690,7 +769,10 @@ void sendStatusJson() {
   j += "\",\"ntpSynced\":";           j += runtime.ntpSynced ? "true" : "false";
   j += ",\"connectedSsid\":\"";       j += wifiOk ? WiFi.SSID() : "";
   j += "\",\"configuredSsid\":\"";    j += String(config.ssid);
-  j += "\"}";
+  j += "\",\"alexaEnabled\":";        j += alexaEnabled ? "true" : "false";
+  j += ",\"alexaDeviceName\":\"";     j += String(alexaDeviceName);
+  j += "\",\"alexaDurationSec\":";    j += alexaDurationSec;
+  j += "}";
 
   server.send(200, "application/json", j);
 }
@@ -854,6 +936,32 @@ void handleHistory() {
   server.send(200, "application/json", j);
 }
 
+void handleAlexaConfig() {
+  if (!server.hasArg("name") || !server.hasArg("duration")) {
+    server.send(400, "text/plain", "Missing args"); return;
+  }
+  String name = server.arg("name");
+  name.trim();
+  if (name.length() < 1 || name.length() >= sizeof(alexaDeviceName)) {
+    server.send(400, "text/plain", "Name must be 1-32 chars"); return;
+  }
+  int dur = server.arg("duration").toInt();
+  if (dur < 5 || dur > 3600) {
+    server.send(400, "text/plain", "Duration must be 5-3600 sec"); return;
+  }
+  memset(alexaDeviceName, 0, sizeof(alexaDeviceName));
+  name.toCharArray(alexaDeviceName, sizeof(alexaDeviceName));
+  alexaDurationSec = static_cast<uint16_t>(dur);
+  saveAlexaConfig();
+  // Update the registered device name at runtime (Alexa sees new name on next discover).
+  if (alexaEnabled) {
+    EspalexaDevice *dev = espalexa.getDevice(0);
+    if (dev) dev->setName(String(alexaDeviceName));
+  }
+  Serial.printf("[%lu] Alexa config: name='%s' dur=%us\n", millis(), alexaDeviceName, alexaDurationSec);
+  sendStatusJson();
+}
+
 // ── HTTP OTA handlers (valve-guarded, password-protected) ──────────────────
 void handleOtaGet() {
   if (!server.authenticate("admin", config.otaPassword)) {
@@ -935,6 +1043,7 @@ void setupRoutes() {
   server.on("/api/skip-today",  HTTP_POST, handleSkipToday);
   server.on("/api/ota-password",HTTP_POST, handleOtaPassword);
   server.on("/api/history",     HTTP_GET,  handleHistory);
+  server.on("/api/alexa-config",HTTP_POST, handleAlexaConfig);
   server.on("/update",          HTTP_GET,  handleOtaGet);
   server.on("/update",          HTTP_POST, handleOtaPost, handleOtaUpload);
   server.onNotFound([]() {
@@ -944,6 +1053,7 @@ void setupRoutes() {
       server.send(302, "text/plain", "");
       return;
     }
+    if (alexaEnabled && espalexa.handleAlexaApiCall(server.uri(), server.arg("plain"))) return;
     server.send(404, "text/plain", "Not found");
   });
 }
@@ -1094,6 +1204,16 @@ void setup() {
   server.begin();
   Serial.printf("[%lu] HTTP server ready\n", millis());
 
+  // Espalexa (Alexa local discovery + control) — STA mode only
+  if (!apMode) {
+    loadAlexaConfig();
+    espalexa.addDevice(alexaDeviceName, alexaCallback, EspalexaDeviceType::onoff);
+    espalexa.begin(&server);
+    alexaEnabled = true;
+    Serial.printf("[%lu] Espalexa ready — device: '%s', dur=%us\n",
+                  millis(), alexaDeviceName, alexaDurationSec);
+  }
+
   // ArduinoOTA (Arduino IDE / espota.py push)
   ArduinoOTA.setHostname("balconipaani");
   ArduinoOTA.setPassword(config.otaPassword);
@@ -1123,6 +1243,7 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
+  if (alexaEnabled) espalexa.loop();
   if (apMode) dnsServer.processNextRequest();
   MDNS.update();
   attemptWifiReconnect();

@@ -1,4 +1,4 @@
-# BalconiPaani MVP2.1 (ESP8266 NodeMCU)
+# BalconiPaani MVP4.0 (ESP8266 NodeMCU)
 
 ## 1) Architecture overview
 
@@ -37,8 +37,10 @@ Install the ESP8266 board package in Arduino IDE (Boards Manager → search "esp
 | `DNSServer.h` | ESP8266 core |
 | `EEPROM.h` | ESP8266 core |
 | `time.h` | ESP8266 core |
+| `LittleFS.h` | ESP8266 core |
+| `Espalexa.h` | [Espalexa by Fabrice Weinberg](https://github.com/Aircoookie/Espalexa) — install via Arduino Library Manager |
 
-No cloud SDK, no MQTT, no extra external libraries.
+No cloud SDK, no MQTT, no external accounts.
 
 ## 4) Complete firmware code
 
@@ -119,7 +121,31 @@ Controls: Mode switch, Valve ON/OFF, Scheduler editor, WiFi onboarding, Reboot.
 7. **Power-cycle resilience** — reboot multiple times; verify config persistence and safe initial relay state.
 8. **NTP unsynced safety** — block NTP (no internet); confirm scheduler does not fire while "NTP unsynced" pill is shown.
 
-## 9) Future roadmap
+## 9) Alexa integration (MVP4.0)
+
+BalconiPaani uses **Espalexa** to emulate a Philips Hue Bridge on the local network. No cloud account, no internet, no AWS Lambda required — Alexa discovers the device via SSDP and sends commands locally.
+
+### Onboarding
+1. Flash MVP4.0 via the `/update` OTA page.
+2. Open the dashboard → **Alexa** card.
+3. Set the device name (default: `balconi paani`) and Alexa-triggered duration.
+4. Save, then open the **Alexa app** → Devices → ➕ → Other → **Discover Devices**.
+5. Alexa finds and adds the device automatically.
+
+### Voice commands
+| Say | Action |
+|-----|--------|
+| "Alexa, turn on balconi paani" | Opens valve; auto-closes after configured duration |
+| "Alexa, turn off balconi paani" | Closes valve immediately |
+
+### Notes
+- Alexa and the ESP8266 must be on the **same WiFi network**.
+- All existing safety mechanisms remain active: hard runtime cap, manual override, valve-OFF before OTA flash.
+- Alexa-triggered watering is recorded in the watering history with reason `alexa_on`.
+- If you rename the device, say "Alexa, discover devices" again after saving (a reboot may help Alexa update the name).
+- Alexa integration is **disabled in AP/setup mode** — connect the device to your home WiFi first.
+
+## 10) Future roadmap
 
 - **Multi-slot schedule table** — weekday rules, multiple daily windows
 - **Soil moisture sensor interlock** — dry-run prevention, skip watering if soil already wet
