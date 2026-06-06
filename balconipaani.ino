@@ -1234,6 +1234,23 @@ void runSchedulerAndSafety() {
     }
   }
 
+  // ── Uptime fallback reboot (if NTP never syncs after 24h) ─────────────────
+  // Failsafe: if WiFi never recovered and time stayed at epoch, reboot after 24h uptime anyway.
+  // This prevents indefinite degradation if device boots offline and never recovers WiFi.
+  // Always triggers before exceeding ~49 days uptime (uint32_t millis rollover).
+  static uint32_t lastUptimeCheckMs = 0;
+  if (elapsedMs(lastUptimeCheckMs, 5000UL)) {  // check every 5 seconds
+    lastUptimeCheckMs = millis();
+    uint32_t uptimeSec = millis() / 1000UL;
+    if (!runtime.ntpSynced && uptimeSec > 86400UL) {  // 24 hours without NTP sync
+      Serial.printf("[%lu] Uptime fallback reboot: 24h+ without NTP sync (uptime=%lus)\n",
+                    millis(), uptimeSec);
+      setValve(false, false, "uptime_fallback_reboot");
+      delay(500);
+      ESP.restart();
+    }
+  }
+
   // ① Hard runtime cap — unconditional; cannot be overridden by any UI action.
   if (runtime.valveOn &&
       elapsedMs(runtime.valveOnSinceMs,
