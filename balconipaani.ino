@@ -89,6 +89,9 @@ struct RuntimeState {
   uint32_t lastValveOffMs;        // 0 = not used this session
   bool     ntpSynced;
   bool     pendingReboot;         // defers ESP.restart() out of HTTP handler
+  uint32_t bootTimeMs;            // millis() at setup() — used to track post-boot WiFi recovery window
+  uint8_t  staSwitchAttemptsInApMode;  // counter for WiFi recovery from AP mode
+  int32_t  lastMidnightCheckDayKey;    // day key when last midnight reboot check ran
 };
 
 // ── Watering history (LittleFS-backed, 30-record rotating CSV) ───────────────
@@ -770,6 +773,44 @@ void startAccessPointMode() {
 }
 
 void attemptWifiReconnect() {
+  // ── STA→AP recovery mode (first 10 min post-boot) ──────────────────────────
+  // If in AP mode but we haven't given up on STA yet, keep trying to recover.
+  if (apMode && strlen(config.ssid) > 0) {
+    uint32_t bootElapsedSec = (millis() - runtime.bootTimeMs) / 1000UL;
+    uint32_t retryIntervalMs = (bootElapsedSec < 600UL) ? 15000UL : 60000UL;  // 15s for first 10min, then 60s
+    if (!elapsedMs(runtime.lastWifiCheckMs, retryIntervalMs)) return;
+    runtime.lastWifiCheckMs = millis();
+    runtime.staSwitchAttemptsInApMode++;
+    Serial.printf("[%lu] AP mode recovery: STA attempt #%u (boot+%lus)\n",
+                  millis(), runtime.staSwitchAttemptsInApMode, bootElapsedSec);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(config.ssid, config.password);
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && !elapsedMs(start, WIFI_CONNECT_TIMEOUT_MS)) {
+      delay(250);
+      yield();
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      apMode = false;
+      dnsServer.stop();
+      Serial.printf("[%lu] STA connected! Exiting AP mode  IP=%s\n",
+                    millis(), WiFi.localIP().toString().c_str());
+      MDNS.begin("balconipaani");
+      startTimeSync();
+      // Restart Espalexa now that STA is up
+      if (!alexaEnabled) {
+        loadAlexaConfig();
+        espalexa.addDevice(String(alexaDeviceName), alexaCallback, 0);
+        espalexa.begin(&server);
+        alexaEnabled = true;
+        Serial.printf("[%lu] Espalexa enabled after STA recovery\n", millis());
+      }
+      return;
+    }
+    return;
+  }
+
+  // ── Normal STA reconnect (already connected, lost link) ─────────────────────
   if (apMode) return;
   if (!elapsedMs(runtime.lastWifiCheckMs, WIFI_RECONNECT_INTERVAL_MS)) return;
   runtime.lastWifiCheckMs = millis();
@@ -1168,6 +1209,31 @@ void runSchedulerAndSafety() {
     digitalWrite(LED_BUILTIN, HIGH);  // off (LED_BUILTIN is active-LOW)
   }
 
+  // ── Midnight reboot failsafe (independent of NTP) ────────────────────────
+  // Reboots daily at midnight to reset state and prevent WiFi degradation.
+  // Detection uses local system clock (set by NTP or user); doesn't require NTP to be synced.
+  static uint32_t lastMidnightCheckMs = 0;
+  if (elapsedMs(lastMidnightCheckMs, 5000UL)) {  // check every 5 seconds
+    lastMidnightCheckMs = millis();
+    time_t now = time(nullptr);
+    if (now > 1700000000UL) {  // only if time is plausible (after ~2023)
+      struct tm tmNow;
+      localtime_r(&now, &tmNow);
+      int32_t dayKey = static_cast<int32_t>(tmNow.tm_year) * 1000 + tmNow.tm_yday;
+      // On day rollover, if we're in the first 60 seconds of the new day (00:00-00:01),
+      // and day changed, trigger reboot.
+      if (dayKey != runtime.lastMidnightCheckDayKey &&
+          tmNow.tm_hour == 0 && tmNow.tm_min == 0) {
+        runtime.lastMidnightCheckDayKey = dayKey;
+        Serial.printf("[%lu] Midnight reboot triggered at %02d:%02d:%02d\n",
+                      millis(), tmNow.tm_hour, tmNow.tm_min, tmNow.tm_sec);
+        setValve(false, false, "midnight_reboot");
+        delay(500);
+        ESP.restart();
+      }
+    }
+  }
+
   // ① Hard runtime cap — unconditional; cannot be overridden by any UI action.
   if (runtime.valveOn &&
       elapsedMs(runtime.valveOnSinceMs,
@@ -1271,6 +1337,7 @@ void setup() {
                 millis(), LittleFS.exists(HISTORY_FILE) ? "exists" : "new");
 
   // Scheduler boot state — confirms fresh runtime (slotsFiredToday always 0 at boot)
+  runtime.bootTimeMs = millis();  // initialize boot time for WiFi recovery window and midnight reboot
   Serial.printf("Scheduler   : autoMode=%s  slotsFiredToday=0x%02X (fresh boot)\n",
                 config.autoMode ? "AUTO" : "MANUAL", runtime.slotsFiredToday);
   for (uint8_t i = 0; i < 3; i++) {
